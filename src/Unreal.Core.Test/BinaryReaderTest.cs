@@ -25,7 +25,7 @@ namespace Unreal.Core.Test
         public void StaticParseNameTest(byte[] rawData)
         {
             using var stream = new MemoryStream(rawData);
-            using var archive = new BinaryReader(stream)
+            using var archive = new PinnedBinaryReader(stream)
             {
                 EngineNetworkVersion = Models.Enums.EngineNetworkVersionHistory.HISTORY_FAST_ARRAY_DELTA_STRUCT
             };
@@ -52,7 +52,7 @@ namespace Unreal.Core.Test
         public void ReadFTransformTest(byte[] rawData)
         {
             using var stream = new MemoryStream(rawData);
-            using var archive = new BinaryReader(stream);
+            using var archive = new PinnedBinaryReader(stream);
 
             archive.ReadFTransfrom();
 
