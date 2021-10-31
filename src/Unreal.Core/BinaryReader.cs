@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.Text;
+using Unreal.Core.MemoryPool;
 using Unreal.Core.Models;
 using Unreal.Core.Models.Enums;
 
@@ -9,12 +10,13 @@ namespace Unreal.Core
     /// <summary>
     /// Custom Binary Reader with methods for Unreal Engine replay files
     /// </summary>
-    public class BinaryReader : FArchive
+    public sealed unsafe class BinaryReader : FArchive
     {
-        public ReadOnlyMemory<byte> Bytes;
-        private int _length;
-        private int _position;
-        public override int Position { get => _position; protected set => Seek(value); }
+        private readonly System.IO.BinaryReader Reader;
+        public Stream BaseStream => Reader.BaseStream;
+        public override int Position { get => (int)BaseStream.Position; protected set => Seek(value); }
+        private readonly IPinnedMemoryOwner<byte>? _owner;
+        public override byte* BasePointer => (byte*)_owner.PinnedMemory.Pointer;
 
         /// <summary>
         /// Initializes a new instance of the CustomBinaryReader class based on the specified stream.
@@ -23,35 +25,44 @@ namespace Unreal.Core
         /// <seealso cref="System.IO.BinaryReader"/> 
         public BinaryReader(Stream input)
         {
-            using var ms = new MemoryStream((int)input.Length);
-            input.CopyTo(ms);
-            Bytes = new ReadOnlyMemory<byte>(ms.ToArray());
-            _length = Bytes.Length;
-            _position = 0;
+            Reader = new System.IO.BinaryReader(input);
         }
 
-        public BinaryReader(ReadOnlyMemory<byte> input)
+        public BinaryReader(int size)
         {
-            Bytes = input;
-            _length = Bytes.Length;
-            _position = 0;
+            if (_owner != null)
+            {
+                throw new InvalidOperationException("Memory object already created");
+            }
+
+            _owner = PinnedMemoryPool<byte>.Shared.Rent(size);
+            Reader = new System.IO.BinaryReader(new UnmanagedMemoryStream((byte*)_owner.PinnedMemory.Pointer, size, size, FileAccess.ReadWrite));
         }
-        
-        public BinaryReader(ReadOnlySpan<byte> input)
+
+        public unsafe MemoryBuffer GetMemoryBuffer(int count)
         {
-            Bytes = input.ToArray();
-            _length = Bytes.Length;
-            _position = 0;
+            // Removes the need for a MemoryPool Rent
+            if (_owner != null)
+            {
+                var buffer = new MemoryBuffer(BasePointer + Position, count);
+                Reader.BaseStream.Seek(count, SeekOrigin.Current);
+                return buffer;
+            }
+
+            var stream = new MemoryBuffer(count);
+            Reader.Read(stream.Memory.Span.Slice(0, count));
+            return stream;
         }
+
 
         public override bool AtEnd()
         {
-            return _position >= _length;
+            return Reader.BaseStream.Position >= Reader.BaseStream.Length;
         }
 
         public override bool CanRead(int count)
         {
-            return _position + count < _length;
+            return Reader.BaseStream.Position + count < Reader.BaseStream.Length;
         }
 
         public override T[] ReadArray<T>(Func<T> func1)
@@ -67,16 +78,12 @@ namespace Unreal.Core
 
         public override bool ReadBoolean()
         {
-            var result = BitConverter.ToBoolean(Bytes.Slice(_position, 1).Span);
-            _position++;
-            return result;
+            return Reader.ReadBoolean();
         }
 
         public override byte ReadByte()
         {
-            var result = Bytes.Slice(_position, 1).Span;
-            _position++;
-            return result[0];
+            return Reader.ReadByte();
         }
 
         public override T ReadByteAsEnum<T>()
@@ -86,9 +93,7 @@ namespace Unreal.Core
 
         public override ReadOnlySpan<byte> ReadBytes(int byteCount)
         {
-            var result = Bytes.Slice(_position, byteCount).Span;
-            _position += byteCount;
-            return result;
+            return Reader.ReadBytes(byteCount);
         }
 
         public override ReadOnlySpan<byte> ReadBytes(uint byteCount)
@@ -98,7 +103,9 @@ namespace Unreal.Core
 
         public override string ReadBytesToString(int count)
         {
-            return Convert.ToHexString(ReadBytes(count)).Replace("-", "");
+            Span<byte> bytes = stackalloc byte[count];
+            Reader.Read(bytes);
+            return Convert.ToHexString(bytes).Replace("-", "");
         }
 
         public override string ReadFString()
@@ -117,7 +124,9 @@ namespace Unreal.Core
             }
 
             var encoding = isUnicode ? Encoding.Unicode : Encoding.Default;
-            return encoding.GetString(ReadBytes(length))
+            Span<byte> bytes = stackalloc byte[length];
+            Reader.Read(bytes);
+            return encoding.GetString(bytes)
                 .Trim(new[] { ' ', '\0' });
         }
 
@@ -189,16 +198,12 @@ namespace Unreal.Core
 
         public override short ReadInt16()
         {
-            var result = BitConverter.ToInt16(Bytes.Slice(_position, 2).Span);
-            _position += 2;
-            return result;
+            return Reader.ReadInt16();
         }
 
         public override int ReadInt32()
         {
-            var result = BitConverter.ToInt32(Bytes.Slice(_position, 4).Span);
-            _position += 4;
-            return result;
+            return Reader.ReadInt32();
         }
 
         public override bool ReadInt32AsBoolean()
@@ -208,9 +213,7 @@ namespace Unreal.Core
 
         public override long ReadInt64()
         {
-            var result = BitConverter.ToInt64(Bytes.Slice(_position, 8).Span);
-            _position += 8;
-            return result;
+            return Reader.ReadInt64();
         }
 
         public override uint ReadIntPacked()
@@ -231,16 +234,12 @@ namespace Unreal.Core
 
         public override sbyte ReadSByte()
         {
-            var result = Bytes.Slice(_position, 1).Span;
-            _position++;
-            return (sbyte)result[0];
+            return Reader.ReadSByte();
         }
 
         public override float ReadSingle()
         {
-            var result = BitConverter.ToSingle(Bytes.Slice(_position, 4).Span);
-            _position += 4;
-            return result;
+            return Reader.ReadSingle();
         }
 
         public override (T, U)[] ReadTupleArray<T, U>(Func<T> func1, Func<U> func2)
@@ -256,16 +255,12 @@ namespace Unreal.Core
 
         public override ushort ReadUInt16()
         {
-            var result = BitConverter.ToUInt16(Bytes.Slice(_position, 2).Span);
-            _position += 2;
-            return result;
+            return Reader.ReadUInt16();
         }
 
         public override uint ReadUInt32()
         {
-            var result = BitConverter.ToUInt32(Bytes.Slice(_position, 4).Span);
-            _position += 4;
-            return result;
+            return Reader.ReadUInt32();
         }
 
         public override bool ReadUInt32AsBoolean()
@@ -280,36 +275,22 @@ namespace Unreal.Core
 
         public override ulong ReadUInt64()
         {
-            var result = BitConverter.ToUInt64(Bytes.Slice(_position, 8).Span);
-            _position += 8;
-            return result;
+            return Reader.ReadUInt64();
         }
 
         public override void Seek(int offset, SeekOrigin seekOrigin = SeekOrigin.Begin)
         {
-            if (offset < 0 || offset > _length || (seekOrigin == SeekOrigin.Current && offset + _position > _length))
-            {
-                IsError = true;
-                return;
-            }
-
-            _ = (seekOrigin switch
-            {
-                SeekOrigin.Begin => _position = offset,
-                SeekOrigin.End => _position = _length - offset,
-                SeekOrigin.Current => _position += offset,
-                _ => _position = offset,
-            });
+            Reader.BaseStream.Seek(offset, seekOrigin);
         }
 
         public override void SkipBytes(uint byteCount)
         {
-            SkipBytes((int)byteCount);
+            Reader.BaseStream.Seek(byteCount, SeekOrigin.Current);
         }
 
         public override void SkipBytes(int byteCount)
         {
-            _position += byteCount;
+            Reader.BaseStream.Seek(byteCount, SeekOrigin.Current);
         }
     }
 }

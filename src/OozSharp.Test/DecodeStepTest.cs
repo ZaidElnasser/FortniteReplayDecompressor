@@ -3,7 +3,7 @@ using Xunit;
 
 namespace OozSharp.Test
 {
-    public class DecodeStepTest
+    public unsafe class DecodeStepTest
     {
         [Theory]
         [InlineData(new byte[] { 0x8C, 0x01 }, "Decoder type LZH not supported")]
@@ -11,8 +11,14 @@ namespace OozSharp.Test
         public void DecodeStepThrows(byte[] rawData, string message)
         {
             var kraken = new Kraken();
-            var exception = Assert.Throws<DecoderException>(() => kraken.Decompress(rawData, 393294));
-            Assert.Equal(message, exception.Message);
+
+            fixed (byte* source = rawData)
+            {
+                var local = source;
+                var exception = Assert.Throws<DecoderException>(() => kraken.Decompress(local, 393294, local, 393294));
+                Assert.Equal(message, exception.Message);
+            }
+
         }
     }
 }

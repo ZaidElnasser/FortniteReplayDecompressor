@@ -9,7 +9,7 @@ namespace Unreal.Core
     /// see https://github.com/EpicGames/UnrealEngine/blob/release/Engine/Source/Runtime/Core/Public/Serialization/Archive.h
     /// see https://github.com/EpicGames/UnrealEngine/blob/release/Engine/Source/Runtime/Core/Private/Serialization/Archive.cpp
     /// </summary>
-    public abstract class FArchive : IDisposable
+    public abstract unsafe class FArchive : IDisposable
     {
         /// <summary>
         /// <see cref="EngineNetworkVersionHistory"/> of current Archive.
@@ -40,6 +40,9 @@ namespace Unreal.Core
         /// Position in current Archive. Set with <see cref="Seek(int, SeekOrigin)"/>
         /// </summary>
         public abstract int Position { get; protected set; }
+
+        public abstract byte* BasePointer { get; }
+
         public bool IsError { get; protected set; } = false;
 
         /// <summary>

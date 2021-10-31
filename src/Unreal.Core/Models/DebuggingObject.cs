@@ -49,12 +49,12 @@ namespace Unreal.Core.Models
 
         public void Serialize(NetBitReader reader)
         {
-            _reader = new NetBitReader(reader.ReadBits(reader.GetBitsLeft()))
-            {
-                EngineNetworkVersion = reader.EngineNetworkVersion
-            };
+            //_reader = new NetBitReader(reader.ReadBits(reader.GetBitsLeft()))
+            //{
+            //    EngineNetworkVersion = reader.EngineNetworkVersion
+            //};
 
-            TotalBits = _reader.GetBitsLeft();
+            //TotalBits = _reader.GetBitsLeft();
         }
 
         private byte[] AsByteArray()
@@ -184,86 +184,87 @@ namespace Unreal.Core.Models
 
         private object[] AsArray()
         {
-            _reader.Reset();
+            return new object[0];
+            //_reader.Reset();
 
-            var totalElements = _reader.ReadIntPacked();
+            //var totalElements = _reader.ReadIntPacked();
 
-            var data = new object[totalElements];
+            //var data = new object[totalElements];
 
-            while (true)
-            {
-                var index = _reader.ReadIntPacked();
+            //while (true)
+            //{
+            //    var index = _reader.ReadIntPacked();
 
-                if (index == 0)
-                {
-                    if (_reader.GetBitsLeft() == 8)
-                    {
-                        var terminator = _reader.ReadIntPacked();
+            //    if (index == 0)
+            //    {
+            //        if (_reader.GetBitsLeft() == 8)
+            //        {
+            //            var terminator = _reader.ReadIntPacked();
 
-                        if (terminator != 0x00)
-                        {
-                            //Log error
-                            return null;
-                        }
-                    }
+            //            if (terminator != 0x00)
+            //            {
+            //                //Log error
+            //                return null;
+            //            }
+            //        }
 
-                    if (_reader.IsError || !_reader.AtEnd())
-                    {
-                        return null;
-                    }
+            //        if (_reader.IsError || !_reader.AtEnd())
+            //        {
+            //            return null;
+            //        }
 
-                    return data;
+            //        return data;
 
-                }
+            //    }
 
-                --index;
+            //    --index;
 
-                if (index >= totalElements)
-                {
-                    return null;
-                }
+            //    if (index >= totalElements)
+            //    {
+            //        return null;
+            //    }
 
-                var handles = new List<DebuggingHandle>();
+            //    var handles = new List<DebuggingHandle>();
 
-                while (true)
-                {
-                    var debuggingHandle = new DebuggingHandle();
+            //    while (true)
+            //    {
+            //        var debuggingHandle = new DebuggingHandle();
 
-                    var handle = _reader.ReadIntPacked();
+            //        var handle = _reader.ReadIntPacked();
 
-                    debuggingHandle.Handle = handle;
+            //        debuggingHandle.Handle = handle;
 
-                    if (handle == 0)
-                    {
-                        break;
-                    }
+            //        if (handle == 0)
+            //        {
+            //            break;
+            //        }
 
-                    --handle;
+            //        --handle;
 
-                    var numBits = _reader.ReadIntPacked();
+            //        var numBits = _reader.ReadIntPacked();
 
-                    debuggingHandle.NumBits = numBits;
+            //        debuggingHandle.NumBits = numBits;
 
-                    var obj = new DebuggingObject();
+            //        var obj = new DebuggingObject();
 
-                    var tempReader = new NetBitReader(_reader.ReadBits(numBits))
-                    {
-                        EngineNetworkVersion = _reader.EngineNetworkVersion
-                    };
+            //        var tempReader = new NetBitReader(_reader.ReadBits(numBits))
+            //        {
+            //            EngineNetworkVersion = _reader.EngineNetworkVersion
+            //        };
 
-                    obj.Serialize(tempReader);
+            //        obj.Serialize(tempReader);
 
-                    data[index] = obj;
+            //        data[index] = obj;
 
-                    handles.Add(debuggingHandle);
-                }
+            //        handles.Add(debuggingHandle);
+            //    }
 
-                //Assume it's an export handle
-                if (handles.Count > 0)
-                {
-                    data[index] = handles;
-                }
-            }
+            //    //Assume it's an export handle
+            //    if (handles.Count > 0)
+            //    {
+            //        data[index] = handles;
+            //    }
+            //}
         }
 
         private List<DebuggingHandle> AsExportHandle()

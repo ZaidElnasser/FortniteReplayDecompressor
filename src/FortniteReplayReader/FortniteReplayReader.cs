@@ -19,7 +19,7 @@ using Unreal.Encryption;
 
 namespace FortniteReplayReader
 {
-    public class ReplayReader : Unreal.Core.ReplayReader<FortniteReplay>
+    public unsafe class ReplayReader : Unreal.Core.ReplayReader<FortniteReplay>
     {
         private FortniteReplayBuilder Builder;
 
@@ -150,6 +150,20 @@ namespace FortniteReplayReader
             {
                 Builder.UpdatePrivateName(channelIndex, new PlayerNameData(externalData.Archive));
             }
+        }
+
+        protected override bool IgnoreGroupOnChannel(uint channelIndex, INetFieldExportGroup exportGroup)
+        {
+            return exportGroup switch
+            {
+                //Always fully parse these
+                Models.NetFieldExports.SupplyDrop _ or SupplyDropLlama _ or SafeZoneIndicator _ or FortPoiManager _ or GameState _ => false,
+                _ => _parseMode switch
+                {
+                    ParseMode.Minimal => true,
+                    _ => false,
+                },
+            };
         }
 
         public override void ReadReplayHeader(FArchive archive)
@@ -329,36 +343,48 @@ namespace FortniteReplayReader
         {
             if (!Replay.Info.IsEncrypted)
             {
-                return new Unreal.Core.BinaryReader(archive.ReadBytes(size))
+                //Not the best way as it's 2 rents, but it works for now
+                using var buffer = ((Unreal.Core.BinaryReader)archive).GetMemoryBuffer(size);
+
+                var decryptedReader = new Unreal.Core.BinaryReader(size)
                 {
                     EngineNetworkVersion = Replay.Header.EngineNetworkVersion,
                     NetworkVersion = Replay.Header.NetworkVersion,
                     ReplayHeaderFlags = Replay.Header.Flags,
                     ReplayVersion = Replay.Info.FileVersion
                 };
+
+                buffer.Stream.CopyTo(decryptedReader.BaseStream);
+                decryptedReader.BaseStream.Seek(0, SeekOrigin.Begin);
+
+                return decryptedReader;
             }
 
-            var key = Replay.Info.EncryptionKey;
-            var encryptedBytes = archive.ReadBytes(size);
+            var key = this.Replay.Info.EncryptionKey;
 
-            using var aesCryptoServiceProvider = new AesCryptoServiceProvider
+            using AesCryptoServiceProvider aesAlg = new AesCryptoServiceProvider()
             {
                 KeySize = key.Length * 8,
                 Key = key.ToArray(),
                 Mode = CipherMode.ECB,
-                Padding = PaddingMode.PKCS7
+                Padding = PaddingMode.PKCS7,
             };
 
-            using var cryptoTransform = aesCryptoServiceProvider.CreateDecryptor();
-            var decryptedArray = cryptoTransform.TransformFinalBlock(encryptedBytes.ToArray(), 0, encryptedBytes.Length);
+            using ICryptoTransform decryptor = aesAlg.CreateDecryptor(aesAlg.Key, null);
+            using var msDecrypt = ((Unreal.Core.BinaryReader)archive).GetMemoryBuffer(size);
+            using CryptoStream csDecrypt = new CryptoStream(msDecrypt.Stream, decryptor, CryptoStreamMode.Read);
 
-            return new Unreal.Core.BinaryReader(decryptedArray.AsMemory())
+            var decrypted = new Unreal.Core.BinaryReader(size)
             {
-                EngineNetworkVersion = archive.EngineNetworkVersion,
-                NetworkVersion = archive.NetworkVersion,
-                ReplayHeaderFlags = archive.ReplayHeaderFlags,
-                ReplayVersion = archive.ReplayVersion
+                EngineNetworkVersion = Replay.Header.EngineNetworkVersion,
+                NetworkVersion = Replay.Header.NetworkVersion,
+                ReplayHeaderFlags = Replay.Header.Flags,
+                ReplayVersion = Replay.Info.FileVersion
             };
+
+            csDecrypt.CopyTo(decrypted.BaseStream);
+            decrypted.BaseStream.Seek(0, SeekOrigin.Begin);
+            return decrypted;
         }
 
         protected override FArchive Decompress(FArchive archive)
@@ -370,18 +396,20 @@ namespace FortniteReplayReader
 
             var decompressedSize = archive.ReadInt32();
             var compressedSize = archive.ReadInt32();
-            var compressedBuffer = archive.ReadBytes(compressedSize);
+            using var compressedMemoryBuffer = ((Unreal.Core.BinaryReader)archive).GetMemoryBuffer(compressedSize);
+
+            var decompressed = new Unreal.Core.BinaryReader(decompressedSize)
+            {
+                EngineNetworkVersion = Replay.Header.EngineNetworkVersion,
+                NetworkVersion = Replay.Header.NetworkVersion,
+                ReplayHeaderFlags = Replay.Header.Flags,
+                ReplayVersion = Replay.Info.FileVersion
+            };
+
+            Oodle.DecompressReplayData(compressedMemoryBuffer.PositionPointer, compressedSize, decompressed.BasePointer, decompressedSize);
 
             _logger?.LogDebug("Decompressed archive from {compressedSize} to {decompressedSize}.", compressedSize, decompressedSize);
-            var output = Oodle.DecompressReplayData(compressedBuffer, decompressedSize);
-
-            return new Unreal.Core.BinaryReader(output)
-            {
-                EngineNetworkVersion = archive.EngineNetworkVersion,
-                NetworkVersion = archive.NetworkVersion,
-                ReplayHeaderFlags = archive.ReplayHeaderFlags,
-                ReplayVersion = archive.ReplayVersion
-            };
+            return decompressed;
         }
     }
 }

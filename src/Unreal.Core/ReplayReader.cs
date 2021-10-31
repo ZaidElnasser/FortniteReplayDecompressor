@@ -14,7 +14,7 @@ namespace Unreal.Core
     /// Abstract base class implementation of default UE replays.
     /// </summary>
     /// <typeparam name="T"></typeparam>
-    public abstract class ReplayReader<T> where T : Replay, new()
+    public abstract unsafe class ReplayReader<T> where T : Replay, new()
     {
         /// <summary>
         /// const int32 UNetConnection::DEFAULT_MAX_CHANNEL_SIZE = 32767; 
@@ -53,7 +53,7 @@ namespace Unreal.Core
         protected const int MAX_GUID_COUNT = 2048;
 
         protected ILogger _logger;
-        protected T Replay { get; set; }
+        protected T? Replay { get; set; }
         protected ParseMode _parseMode;
         protected bool IsDebugMode => _parseMode == ParseMode.Debug;
 
@@ -67,6 +67,12 @@ namespace Unreal.Core
 
         private int InPacketId;
         private DataBunch? PartialBunch;
+
+        // Allocate these once
+        private readonly DataBunch _currentBunch = new();
+        private readonly NetBitReader _packetReader = new();
+        private readonly NetBitReader _exportReader = new();
+        private readonly NetDeltaUpdate _deltaUpdate = new();
 
         /// <summary>
         /// Index of latest received bunch sequence.
@@ -166,8 +172,8 @@ namespace Unreal.Core
                 SizeInBytes = archive.ReadInt32()
             };
 
-            using FArchive? decrypted = DecryptBuffer(archive, info.SizeInBytes);
-            using FArchive? binaryArchive = Decompress(decrypted);
+            using var decrypted = DecryptBuffer(archive, info.SizeInBytes);
+            using var binaryArchive = Decompress(decrypted);
 
             // SerializeDeletedStartupActors
             // https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DemoNetDriver.cpp#L1916
@@ -256,7 +262,7 @@ namespace Unreal.Core
                 var numNetFieldExportGroups = binaryArchive.ReadUInt32();
                 for (var i = 0; i < numNetFieldExportGroups; i++)
                 {
-                    NetFieldExportGroup? group = ReadNetFieldExportGroupMap(binaryArchive);
+                    var group = ReadNetFieldExportGroupMap(binaryArchive);
 
                     // Add the export group to the map
                     _netGuidCache.NetFieldExportGroupIndexToGroup[group.PathNameIndex] = group.PathName;
@@ -265,7 +271,7 @@ namespace Unreal.Core
             }
 
             //Remove all actors
-            foreach (UChannel? channel in Channels)
+            foreach (var channel in Channels)
             {
                 if (channel == null)
                 {
@@ -306,7 +312,7 @@ namespace Unreal.Core
         {
             while (!archive.AtEnd())
             {
-                ReplayChunkType chunkType = archive.ReadUInt32AsEnum<ReplayChunkType>();
+                var chunkType = archive.ReadUInt32AsEnum<ReplayChunkType>();
                 var chunkSize = archive.ReadInt32();
                 var offset = archive.Position;
 
@@ -364,8 +370,8 @@ namespace Unreal.Core
                 archive.ReadInt32();
             }
 
-            using FArchive? decrypted = DecryptBuffer(archive, info.Length);
-            using FArchive? binaryArchive = Decompress(decrypted);
+            using var decrypted = DecryptBuffer(archive, info.Length);
+            using var binaryArchive = Decompress(decrypted);
             while (!binaryArchive.AtEnd())
             {
                 ReadDemoFrameIntoPlaybackPackets(binaryArchive);
@@ -461,6 +467,14 @@ namespace Unreal.Core
             archive.NetworkVersion = header.NetworkVersion;
 
             Replay.Header = header;
+
+            _packetReader.EngineNetworkVersion = header.EngineNetworkVersion;
+            _packetReader.NetworkVersion = header.NetworkVersion;
+            _packetReader.ReplayHeaderFlags = header.Flags;
+
+            _exportReader.EngineNetworkVersion = header.EngineNetworkVersion;
+            _exportReader.NetworkVersion = header.NetworkVersion;
+            _exportReader.ReplayHeaderFlags = header.Flags;
         }
 
 
@@ -478,7 +492,7 @@ namespace Unreal.Core
                 throw new InvalidReplayException("Invalid replay file");
             }
 
-            ReplayVersionHistory fileVersion = archive.ReadUInt32AsEnum<ReplayVersionHistory>();
+            var fileVersion = archive.ReadUInt32AsEnum<ReplayVersionHistory>();
             archive.ReplayVersion = fileVersion;
 
             if (fileVersion > ReplayVersionHistory.LATEST)
@@ -549,8 +563,8 @@ namespace Unreal.Core
                 return PacketState.Error;
             }
 
-            // https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DemoNetDriver.cpp#L3338
-            ReceivedRawPacket(archive.ReadBytes(bufferSize));
+            // https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DemoNetDriver.cpp#L3338BinaryReader
+            ReceivedRawPacket(archive, bufferSize);
             return PacketState.Success;
         }
 
@@ -574,14 +588,7 @@ namespace Unreal.Core
 
                 _netGuidCache.ExternalData[netGuid] = new ExternalData()
                 {
-                    Archive = new BinaryReader(archive.ReadBytes((externalDataNumBits + 7) >> 3))
-                    {
-                        NetworkReplayVersion = archive.NetworkReplayVersion,
-                        EngineNetworkVersion = archive.EngineNetworkVersion,
-                        ReplayHeaderFlags = archive.ReplayHeaderFlags,
-                        ReplayVersion = archive.ReplayVersion,
-                        NetworkVersion = archive.NetworkVersion
-                    },
+                    Archive = archive.ReadBytes((externalDataNumBits + 7) >> 3).ToArray(),
                     NetGUID = netGuid
                 };
             }
@@ -635,7 +642,7 @@ namespace Unreal.Core
 
             for (var i = 0; i < group.NetFieldExportsLength; i++)
             {
-                NetFieldExport? netFieldExport = ReadNetFieldExport(archive);
+                var netFieldExport = ReadNetFieldExport(archive);
                 if (netFieldExport != null)
                 {
                     group.NetFieldExports[netFieldExport.Handle] = netFieldExport;
@@ -664,8 +671,17 @@ namespace Unreal.Core
             for (var i = 0; i < numGuids; i++)
             {
                 var size = archive.ReadInt32();
-                var reader = new NetBitReader(archive.ReadBytes(size));
-                InternalLoadObject(reader, true);
+
+                try
+                {
+                    _exportReader.SetBits(archive.BasePointer + archive.Position, size, size * 8);
+                    archive.Seek(size, SeekOrigin.Current);
+                    InternalLoadObject(_exportReader, true);
+                }
+                finally
+                {
+                    _exportReader.DisposeBits();
+                }
             }
         }
 
@@ -706,7 +722,7 @@ namespace Unreal.Core
                     group = _netGuidCache.GetNetFieldExportGroupFromIndex(pathNameIndex);
                 }
 
-                NetFieldExport? netField = ReadNetFieldExport(archive);
+                var netField = ReadNetFieldExport(archive);
                 if (group != null && netField != null)
                 {
                     group.NetFieldExports[netField.Handle] = netField;
@@ -835,7 +851,7 @@ namespace Unreal.Core
                     group = _netGuidCache.GetNetFieldExportGroupFromIndex(pathNameIndex);
                 }
 
-                NetFieldExport? netField = ReadNetFieldExport(bitArchive);
+                var netField = ReadNetFieldExport(bitArchive);
                 if (group != null && netField is not null && group.IsValidIndex(netField.Handle))
                 {
                     //netField.Incompatible = group.NetFieldExports[(int)netField.Handle].Incompatible;
@@ -870,7 +886,7 @@ namespace Unreal.Core
 
             if (netGuid.IsDefault() || isExportingNetGUIDBunch)
             {
-                ExportFlags flags = archive.ReadByteAsEnum<ExportFlags>();
+                var flags = archive.ReadByteAsEnum<ExportFlags>();
 
                 if (flags.HasFlag(ExportFlags.bHasPath))
                 {
@@ -1027,7 +1043,7 @@ namespace Unreal.Core
                         _logger?.LogDebug("Merging Partial Bunch: {} bits", bitsLeft);
                         if (!bunch.bHasPackageMapExports && bitsLeft > 0)
                         {
-                            PartialBunch.Archive.AppendDataFromChecked(bunch.Archive.ReadBits(bitsLeft), bitsLeft);
+                            PartialBunch.Archive.AppendDataFromChecked(bunch.Archive.ReadBits(bitsLeft));
                         }
 
                         // Only the final partial bunch should ever be non byte aligned. This is enforced during partial bunch creation
@@ -1059,6 +1075,8 @@ namespace Unreal.Core
                             PartialBunch.bIsReplicationPaused = bunch.bIsReplicationPaused;
                             PartialBunch.bHasMustBeMappedGUIDs = bunch.bHasMustBeMappedGUIDs;
                             ReceivedSequencedBunch(PartialBunch);
+
+                            PartialBunch.Archive.Dispose();
                             return;
                         }
                         return;
@@ -1135,7 +1153,7 @@ namespace Unreal.Core
         /// </summary>
         public virtual void ProcessBunch(DataBunch bunch)
         {
-            UChannel? channel = Channels[bunch.ChIndex];
+            var channel = Channels[bunch.ChIndex];
 
             if (channel != null && channel.Actor is null)
             {
@@ -1198,32 +1216,50 @@ namespace Unreal.Core
                 }
             }
 
+            var innerArchiveError = false;
             //  Read chunks of actor content
-            while (!bunch.Archive.AtEnd())
+            while (!bunch.Archive.AtEnd() && !innerArchiveError)
             {
-                var repObject = ReadContentBlockPayload(bunch, out var bObjectDeleted, out var bHasRepLayout, out FBitArchive? reader);
+                var repObject = ReadContentBlockPayload(bunch, out var bObjectDeleted, out var bHasRepLayout, out var payload);
 
-                if (bObjectDeleted)
+                NetBitReader? reader = null;
+                if (payload > 0)
                 {
-                    continue;
+                    bunch.Archive.SetTempEnd((int)payload, 3);
+                    reader = bunch.Archive;
                 }
 
-                if (bunch.Archive.IsError)
+                try
                 {
-                    _logger?.LogWarning("UActorChannel::ReceivedBunch: ReadContentBlockPayload FAILED. bunch: {}", bunchIndex);
-                    break;
-                }
+                    if (bObjectDeleted)
+                    {
+                        continue;
+                    }
 
-                if (repObject is null || reader is null || reader.AtEnd())
-                {
-                    // Nothing else in this block, continue on (should have been a delete or create block)
-                    continue;
-                }
+                    if (bunch.Archive.IsError)
+                    {
+                        _logger?.LogWarning("UActorChannel::ReceivedBunch: ReadContentBlockPayload FAILED. bunch: {}", bunchIndex);
+                        break;
+                    }
 
-                if (!ReceivedReplicatorBunch(bunch, reader, repObject, bHasRepLayout))
+                    if (repObject is null || reader is null || reader.AtEnd())
+                    {
+                        // Nothing else in this block, continue on (should have been a delete or create block)
+                        continue;
+                    }
+
+                    if (!ReceivedReplicatorBunch(bunch, reader, repObject, bHasRepLayout))
+                    {
+                        continue;
+                    }
+                }
+                finally
                 {
-                    _logger?.LogInformation("UActorChannel::ProcessBunch: Replicator.ReceivedBunch returned false");
-                    continue;
+                    innerArchiveError = bunch.Archive.IsError;
+                    if (payload > 0)
+                    {
+                        bunch.Archive.RestoreTemp(3);
+                    }
                 }
             }
         }
@@ -1231,9 +1267,9 @@ namespace Unreal.Core
         /// <summary>
         /// see https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/Engine/Private/DataReplication.cpp#L896
         /// </summary>
-        public virtual bool ReceivedReplicatorBunch(DataBunch bunch, FBitArchive archive, uint? repObject, bool bHasRepLayout)
+        public virtual bool ReceivedReplicatorBunch(DataBunch bunch, NetBitReader archive, uint? repObject, bool bHasRepLayout)
         {
-            NetFieldExportGroup? netFieldExportGroup = _netGuidCache.GetNetFieldExportGroup(repObject);
+            var netFieldExportGroup = _netGuidCache.GetNetFieldExportGroup(repObject);
 
             if (netFieldExportGroup is null)
             {
@@ -1258,81 +1294,99 @@ namespace Unreal.Core
                 return true;
             }
 
-            if (!_netGuidCache.TryGetClassNetCache(netFieldExportGroup.PathName, out NetFieldExportGroup? classNetCache, bunch.Archive.EngineNetworkVersion >= EngineNetworkVersionHistory.HISTORY_CLASSNETCACHE_FULLNAME))
+            if (!_netGuidCache.TryGetClassNetCache(netFieldExportGroup.PathName, out var classNetCache, bunch.Archive.EngineNetworkVersion >= EngineNetworkVersionHistory.HISTORY_CLASSNETCACHE_FULLNAME))
             {
                 _logger?.LogDebug("Couldnt find ClassNetCache for {}", netFieldExportGroup.PathName);
                 return false;
             }
 
             // Read fields from stream
-            while (ReadFieldHeaderAndPayload(archive, classNetCache, out NetFieldExport? fieldCache, out FBitArchive? reader))
+            while (ReadFieldHeaderAndPayload(archive, classNetCache, out var fieldCache, out var payload))
             {
-                if (fieldCache == null)
+                try
                 {
-                    _logger?.LogInformation("ReceivedBunch: FieldCache == nullptr: {}", classNetCache.PathName);
-                    continue;
-                }
+                    NetBitReader? reader = null;
 
-                if (fieldCache.Incompatible)
-                {
-                    // We've already warned about this property once, so no need to continue to do so
-                    _logger?.LogDebug("ReceivedBunch: FieldCache->bIncompatible == true: {}", fieldCache.Name);
-                    continue;
-                }
-
-                if (reader is null || reader.IsError || reader.AtEnd())
-                {
-                    _logger?.LogDebug("ReceivedBunch: reader == nullptr or IsError: {}", classNetCache.PathName);
-                    continue;
-                }
-
-                if (!_netFieldParser.WillReadClassNetCache(classNetCache.PathName))
-                {
-                    continue;
-                }
-
-                if (_netFieldParser.TryGetClassNetCacheProperty(fieldCache.Name, classNetCache.PathName, out NetFieldParser.ClassNetCachePropertyInfo? classNetProperty))
-                {
-                    if (classNetProperty.IsFunction)
+                    if (payload.HasValue)
                     {
-                        // Handle function call
-                        NetFieldExportGroup? functionGroup = _netGuidCache.GetNetFieldExportGroup(classNetProperty.PathName);
-                        if (!ReceivedRPC(reader, functionGroup, bunch.ChIndex))
-                        {
-                            return false;
-                        }
+                        archive.SetTempEnd((int)payload, 5);
+                        reader = archive;
                     }
-                    else
+
+                    if (fieldCache == null)
                     {
-                        // Handle property
-                        if (classNetProperty.IsCustomStruct)
+                        _logger?.LogInformation("ReceivedBunch: FieldCache == nullptr: {}", classNetCache.PathName);
+                        continue;
+                    }
+
+                    if (fieldCache.Incompatible)
+                    {
+                        // We've already warned about this property once, so no need to continue to do so
+                        _logger?.LogDebug("ReceivedBunch: FieldCache->bIncompatible == true: {}", fieldCache.Name);
+                        continue;
+                    }
+
+                    if (reader is null || reader.IsError || reader.AtEnd())
+                    {
+                        _logger?.LogDebug("ReceivedBunch: reader == nullptr or IsError: {}", classNetCache.PathName);
+                        continue;
+                    }
+
+                    if (!_netFieldParser.WillReadClassNetCache(classNetCache.PathName))
+                    {
+                        continue;
+                    }
+
+                    if (_netFieldParser.TryGetClassNetCacheProperty(fieldCache.Name, classNetCache.PathName, out var classNetProperty))
+                    {
+                        if (classNetProperty.IsFunction)
                         {
-                            if (!ReceiveCustomProperty(reader, classNetProperty, bunch.ChIndex))
+                            // Handle function call
+                            var functionGroup = _netGuidCache.GetNetFieldExportGroup(classNetProperty.PathName);
+                            if (!ReceivedRPC(reader, functionGroup, bunch.ChIndex))
                             {
-                                _logger?.LogWarning("Failed to parse custom property {pathName} {name} (bunchIndex: {bunchIndex})", classNetCache.PathName, fieldCache.Name, bunchIndex);
-                                continue;
+                                return false;
                             }
                         }
                         else
                         {
-                            NetFieldExportGroup? group = _netGuidCache.GetNetFieldExportGroup(classNetProperty.PathName);
-                            if (group is null || !_netFieldParser.WillReadType(group.PathName))
+                            // Handle property
+                            if (classNetProperty.IsCustomStruct)
                             {
-                                continue;
+                                if (!ReceiveCustomProperty(reader, classNetCache, fieldCache, bunch.ChIndex))
+                                {
+                                    _logger?.LogWarning("Failed to parse custom property {pathName} {name} (bunchIndex: {bunchIndex})", classNetCache.PathName, fieldCache.Name, bunchIndex);
+                                    continue;
+                                }
                             }
-
-                            if (!ReceiveCustomDeltaProperty(reader, group, bunch.ChIndex, classNetProperty.EnablePropertyChecksum))
+                            else
                             {
-                                //FieldCache->bIncompatible = true; TODO?
-                                _logger?.LogWarning("Failed to parse custom delta property {name} (bunchIndex: {bunchIndex})", fieldCache.Name, bunchIndex);
-                                continue;
+                                var group = _netGuidCache.GetNetFieldExportGroup(classNetProperty.PathName);
+                                if (group is null || !_netFieldParser.WillReadType(group.PathName))
+                                {
+                                    continue;
+                                }
+
+                                if (!ReceiveCustomDeltaProperty(reader, group, bunch.ChIndex, classNetProperty.EnablePropertyChecksum))
+                                {
+                                    //FieldCache->bIncompatible = true; TODO?
+                                    _logger?.LogWarning("Failed to parse custom delta property {name} (bunchIndex: {bunchIndex})", fieldCache.Name, bunchIndex);
+                                    continue;
+                                }
                             }
                         }
                     }
+                    else
+                    {
+                        _logger?.LogDebug("Skipping struct {name} from group {pathName}", fieldCache.Name, classNetCache.PathName);
+                    }
                 }
-                else
+                finally
                 {
-                    _logger?.LogDebug("Skipping struct {name} from group {pathName}", fieldCache.Name, classNetCache.PathName);
+                    if (payload.HasValue)
+                    {
+                        archive.RestoreTemp(5);
+                    }
                 }
             }
 
@@ -1351,14 +1405,8 @@ namespace Unreal.Core
                 return false;
             }
 
-            if (Channels[channelIndex]!.IsIgnoringGroup(group.PathName))
-            {
-                _logger?.LogInformation("Ignoring channel for type {}", group.PathName);
-                return false;
-            }
-
             _logger?.LogDebug("ReceiveExternalData: group {}", group.PathName);
-            if (_netGuidCache.TryGetExternalData(Channels[channelIndex]?.Actor?.ActorNetGUID?.Value, out IExternalData? externalData))
+            if (_netGuidCache.TryGetExternalData(Channels[channelIndex]?.Actor?.ActorNetGUID?.Value, out var externalData))
             {
                 OnExternalDataRead(channelIndex, externalData);
             }
@@ -1370,7 +1418,7 @@ namespace Unreal.Core
         /// see https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/Engine/Private/DataReplication.cpp#L1158
         /// see https://github.com/EpicGames/UnrealEngine/blob/8776a8e357afff792806b997fbbd8e715111a271/Engine/Source/Runtime/Engine/Private/RepLayout.cpp#L5801
         /// </summary>
-        public virtual bool ReceivedRPC(FBitArchive reader, NetFieldExportGroup? netFieldExportGroup, uint channelIndex)
+        public virtual bool ReceivedRPC(NetBitReader reader, NetFieldExportGroup? netFieldExportGroup, uint channelIndex)
         {
             if (netFieldExportGroup is null)
             {
@@ -1399,34 +1447,37 @@ namespace Unreal.Core
         /// We didnt really know how certain properties were parsed, so we mark those with <see cref="NetFieldParser.ClassNetCachePropertyInfo.IsCustomStruct"/>
         /// and we deserialize and/or resolve them 'manually' here.
         /// </summary>
-        public virtual bool ReceiveCustomProperty(FBitArchive reader, NetFieldParser.ClassNetCachePropertyInfo fieldCache, uint channelIndex)
+        public virtual bool ReceiveCustomProperty(NetBitReader reader, NetFieldExportGroup classNetCache, NetFieldExport fieldCache, uint channelIndex)
         {
-            IProperty? export = _netFieldParser.CreatePropertyType(fieldCache.PropertyInfo.PropertyType);
+            var export = _netFieldParser.CreatePropertyType(classNetCache.PathName, fieldCache.Name);
             if (export != null)
             {
-                var numBits = reader.GetBitsLeft();
-                var cmdReader = new NetBitReader(reader.ReadBits(numBits), numBits)
+                try
                 {
-                    EngineNetworkVersion = reader.EngineNetworkVersion,
-                    NetworkVersion = reader.NetworkVersion
-                };
-                export.Serialize(cmdReader);
+                    var numBits = reader.GetBitsLeft();
+                    reader.SetTempEnd(numBits, 2);
 
-                if (cmdReader.IsError)
-                {
-                    _logger?.LogWarning("Custom Property {} caused error when reading (bits: {})", fieldCache.Name, cmdReader.LastBit);
+                    export.Serialize(reader);
+
+                    if (reader.IsError)
+                    {
+                        _logger?.LogWarning("Custom Property {} caused error when reading (bits: {})", fieldCache.Name, reader.LastBit);
+                    }
+
+                    if (!reader.AtEnd())
+                    {
+                        _logger?.LogWarning("Custom Property {name} didnt read proper number of bits: {bitsLeft} out of {bits}", fieldCache.Name, (reader.LastBit - reader.GetBitsLeft()), reader.LastBit);
+                    }
+
+                    (export as IResolvable)?.Resolve(_netGuidCache);
+
+                    OnExportRead(channelIndex, export as INetFieldExportGroup);
+                    return true;
                 }
-
-                if (!cmdReader.AtEnd())
+                finally
                 {
-                    _logger?.LogWarning("Custom Property {name} didnt read proper number of bits: {bitsLeft} out of {bits}", fieldCache.Name, (cmdReader.LastBit - cmdReader.GetBitsLeft()), cmdReader.LastBit);
+                    reader.RestoreTemp(2);
                 }
-
-                (export as IResolvable)?.Resolve(_netGuidCache);
-
-                OnExportRead(channelIndex, export as INetFieldExportGroup);
-
-                return true;
             }
             return false;
         }
@@ -1434,7 +1485,7 @@ namespace Unreal.Core
         /// <summary>
         /// see https://github.com/EpicGames/UnrealEngine/blob/8776a8e357afff792806b997fbbd8e715111a271/Engine/Source/Runtime/Engine/Private/RepLayout.cpp#L3744
         /// </summary>
-        public virtual bool ReceiveCustomDeltaProperty(FBitArchive reader, NetFieldExportGroup group, uint channelIndex, bool enablePropertyChecksum)
+        public virtual bool ReceiveCustomDeltaProperty(NetBitReader reader, NetFieldExportGroup group, uint channelIndex, bool enablePropertyChecksum)
         {
             if (reader.EngineNetworkVersion >= EngineNetworkVersionHistory.HISTORY_FAST_ARRAY_DELTA_STRUCT)
             {
@@ -1473,13 +1524,13 @@ namespace Unreal.Core
         /// <summary>
         /// see https://github.com/EpicGames/UnrealEngine/blob/8776a8e357afff792806b997fbbd8e715111a271/Engine/Source/Runtime/Engine/Classes/Engine/NetSerialization.h#L1064
         /// </summary>
-        public virtual bool NetDeltaSerialize(FBitArchive reader, NetFieldExportGroup group, uint channelIndex, bool enablePropertyChecksum)
+        public virtual bool NetDeltaSerialize(NetBitReader reader, NetFieldExportGroup group, uint channelIndex, bool enablePropertyChecksum)
         {
             // https://github.com/EpicGames/UnrealEngine/blob/8776a8e357afff792806b997fbbd8e715111a271/Engine/Source/Runtime/Engine/Private/RepLayout.cpp#L6302
             // DeltaSerializeFastArrayProperty
 
             // Read header
-            FFastArraySerializerHeader? header = NetDeltaSerializeHeader(reader);
+            var header = NetDeltaSerializeHeader(reader);
 
             if (reader.IsError)
             {
@@ -1492,11 +1543,11 @@ namespace Unreal.Core
                 for (var i = 0; i < header.NumDeletes; ++i)
                 {
                     var elementIndex = reader.ReadInt32();
-                    OnNetDeltaRead(channelIndex, new NetDeltaUpdate
-                    {
-                        Deleted = true,
-                        ElementIndex = elementIndex
-                    });
+                    _deltaUpdate.Deleted = true;
+                    _deltaUpdate.Export = null;
+                    _deltaUpdate.ElementIndex = elementIndex;
+                    _deltaUpdate.ChannelIndex = channelIndex;
+                    OnNetDeltaRead(channelIndex, _deltaUpdate);
                 }
             }
 
@@ -1506,13 +1557,14 @@ namespace Unreal.Core
                 var elementIndex = reader.ReadInt32();
 
                 // https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/Engine/Private/DataReplication.cpp#L896
-                ReceiveProperties(reader, group, channelIndex, out INetFieldExportGroup? export, !enablePropertyChecksum, netDeltaUpdate: true);
+                ReceiveProperties(reader, group, channelIndex, out var export, !enablePropertyChecksum, netDeltaUpdate: true);
 
-                OnNetDeltaRead(channelIndex, new NetDeltaUpdate
-                {
-                    ElementIndex = elementIndex,
-                    Export = export
-                });
+                _deltaUpdate.Deleted = false;
+                _deltaUpdate.Export = export;
+                _deltaUpdate.ElementIndex = elementIndex;
+                _deltaUpdate.ChannelIndex = channelIndex;
+
+                OnNetDeltaRead(channelIndex, _deltaUpdate);
             }
 
             return true;
@@ -1523,7 +1575,7 @@ namespace Unreal.Core
         ///  https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/Engine/Private/RepLayout.cpp#L2971
         ///  https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/Engine/Private/RepLayout.cpp#L3022
         /// </summary>
-        public virtual bool ReceiveProperties(FBitArchive archive, NetFieldExportGroup group, uint channelIndex, [NotNullWhen(returnValue: true)] out INetFieldExportGroup? exportGroup, bool enablePropertyChecksum = true, bool netDeltaUpdate = false)
+        public virtual bool ReceiveProperties(NetBitReader archive, NetFieldExportGroup group, uint channelIndex, [NotNullWhen(returnValue: true)] out INetFieldExportGroup? exportGroup, bool enablePropertyChecksum = true, bool netDeltaUpdate = false)
         {
             exportGroup = default;
 
@@ -1546,7 +1598,7 @@ namespace Unreal.Core
 
 #if DEBUG
                 Debug("not-reading-groups", group.PathName);
-                foreach (NetFieldExport? field in group.NetFieldExports)
+                foreach (var field in group.NetFieldExports)
                 {
                     if (field == null)
                     {
@@ -1595,7 +1647,7 @@ namespace Unreal.Core
                     return false;
                 }
 
-                NetFieldExport? export = group.NetFieldExports[handle];
+                var export = group.NetFieldExports[handle];
                 var numBits = archive.ReadIntPacked();
 
                 if (numBits == 0)
@@ -1621,11 +1673,8 @@ namespace Unreal.Core
                 hasdata = true;
                 try
                 {
-                    var cmdReader = new NetBitReader(archive.ReadBits(numBits), (int)numBits)
-                    {
-                        EngineNetworkVersion = archive.EngineNetworkVersion,
-                        NetworkVersion = archive.NetworkVersion
-                    };
+                    archive.SetTempEnd((int)numBits, 1);
+                    var cmdReader = archive;
 
                     if (!_netFieldParser.ReadField(exportGroup, export, handle, group, cmdReader))
                     {
@@ -1648,23 +1697,38 @@ namespace Unreal.Core
 
                     if (!cmdReader.AtEnd())
                     {
-                        _logger?.LogWarning("Property {name} (handle: {handle}, path: {pathName}) didnt read proper number of bits: {numBitsLeft} out of {numBits}", export.Name, handle, group.PathName, (cmdReader.LastBit - cmdReader.GetBitsLeft()), numBits);
-                        export.Incompatible = true;
-
+                        if (cmdReader.GetBitsLeft() == numBits)
+                        {
+                            _logger?.LogWarning("Property {name} (handle: {handle}, path: {pathName}) is missing. Bits: {numBits}", export.Name, handle, group.PathName, numBits);
+                            export.Incompatible = true;
 #if DEBUG
-                        Debug("failed-properties", $"Property {export.Name} (handle: {handle}, path: {group.PathName}) didnt read proper number of bits: {(cmdReader.LastBit - cmdReader.GetBitsLeft())} out of {numBits}");
-                        cmdReader.Reset();
-                        Debug($"cmd-{export.Name}-{numBits}", "cmds", cmdReader.ReadBytes(Math.Max((int)Math.Ceiling(cmdReader.GetBitsLeft() / 8.0), 1)));
+                            Debug("missing-properties", $"Property {export.Name} (handle: {handle}, path: {group.PathName}) is missing. Bits: {numBits}");
+                            //Debug($"cmd-{export.Name}-{numBits}", "cmds", cmdReader.ReadBytes(Math.Max((int)Math.Ceiling(cmdReader.GetBitsLeft() / 8.0), 1)));
 #endif
+                        }
+                        else
+                        {
+                            _logger?.LogWarning("Property {name} (handle: {handle}, path: {pathName}) didnt read proper number of bits: {numBitsLeft} out of {numBits}", export.Name, handle, group.PathName, (numBits - cmdReader.GetBitsLeft()), numBits);
+                            export.Incompatible = true;
+#if DEBUG
+                            Debug("failed-properties", $"Property {export.Name} (handle: {handle}, path: {group.PathName}) is missing. Bits: {numBits}");
+                            //Debug($"cmd-{export.Name}-{numBits}", "cmds", cmdReader.ReadBytes(Math.Max((int)Math.Ceiling(cmdReader.GetBitsLeft() / 8.0), 1)));
+#endif
+                        }
+
                         continue;
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger?.LogError("NetFieldParser exception. Ex: {}", ex.Message);
+                    _logger?.LogError(ex, "NetFieldParser exception for property: {}, path: {}", export.Name, group.PathName);
 #if DEBUG
                     Debug("failed-properties", $"Property {export.Name} (handle: {handle}, path: {group.PathName}, bits: {numBits}) threw exception {ex.Message}");
 #endif
+                }
+                finally
+                {
+                    archive.RestoreTemp(1);
                 }
             }
 
@@ -1679,11 +1743,11 @@ namespace Unreal.Core
         /// <summary>
         /// see https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L3579
         /// </summary>
-        public virtual bool ReadFieldHeaderAndPayload(FBitArchive archive, [NotNull] NetFieldExportGroup group, out NetFieldExport? outField, out FBitArchive? reader)
+        public virtual bool ReadFieldHeaderAndPayload(FBitArchive archive, [NotNull] NetFieldExportGroup group, out NetFieldExport? outField, out uint? numPayloadBits)
         {
             if (archive.AtEnd())
             {
-                reader = null;
+                numPayloadBits = null;
                 outField = null;
                 return false;
             }
@@ -1692,7 +1756,7 @@ namespace Unreal.Core
             var netFieldExportHandle = archive.ReadSerializedInt(Math.Max((int)group.NetFieldExportsLength, 2));
             if (archive.IsError)
             {
-                reader = null;
+                numPayloadBits = null;
                 outField = null;
                 _logger?.LogWarning("ReadFieldHeaderAndPayload: Error reading NetFieldExportHandle.");
                 return false;
@@ -1701,10 +1765,10 @@ namespace Unreal.Core
             // const FNetFieldExport& NetFieldExport = NetFieldExportGroup->NetFieldExports[NetFieldExportHandle];
             outField = group.NetFieldExports[(int)netFieldExportHandle];
 
-            var numPayloadBits = archive.ReadIntPacked();
+            numPayloadBits = archive.ReadIntPacked();
             if (archive.IsError)
             {
-                reader = null;
+                numPayloadBits = null;
                 outField = null;
                 _logger?.LogWarning("ReadFieldHeaderAndPayload: Error reading numbits.");
                 return false;
@@ -1712,15 +1776,9 @@ namespace Unreal.Core
 
             if (!archive.CanRead((int)numPayloadBits))
             {
-                reader = null;
+                numPayloadBits = null;
                 return false;
             }
-
-            reader = new BitReader(archive.ReadBits(numPayloadBits), (int)numPayloadBits)
-            {
-                EngineNetworkVersion = archive.EngineNetworkVersion,
-                NetworkVersion = archive.NetworkVersion
-            };
 
             if (archive.IsError)
             {
@@ -1735,11 +1793,11 @@ namespace Unreal.Core
         /// <summary>
         /// see https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L3391
         /// </summary>
-        public virtual uint? ReadContentBlockPayload(DataBunch bunch, out bool bObjectDeleted, out bool bOutHasRepLayout, out FBitArchive? reader)
+        public virtual uint? ReadContentBlockPayload(DataBunch bunch, out bool bObjectDeleted, out bool bOutHasRepLayout, out uint? numPayloadBits)
         {
             // Read the content block header and payload
             var repObject = ReadContentBlockHeader(bunch, out bOutHasRepLayout, out bObjectDeleted);
-            reader = null;
+            numPayloadBits = null;
 
             if (bObjectDeleted)
             {
@@ -1747,12 +1805,7 @@ namespace Unreal.Core
                 return repObject;
             }
 
-            var numPayloadBits = bunch.Archive.ReadIntPacked();
-            reader = new BitReader(bunch.Archive.ReadBits(numPayloadBits), (int)numPayloadBits)
-            {
-                EngineNetworkVersion = bunch.Archive.EngineNetworkVersion,
-                NetworkVersion = bunch.Archive.NetworkVersion
-            };
+            numPayloadBits = bunch.Archive.ReadIntPacked();
             return repObject;
         }
 
@@ -1772,7 +1825,7 @@ namespace Unreal.Core
 
             // We need to handle a sub-object
             // Manually serialize the object so that we can get the NetGUID (in order to assign it if we spawn the object here)
-            NetworkGUID? netGuid = InternalLoadObject(bunch.Archive, false);
+            var netGuid = InternalLoadObject(bunch.Archive, false);
 
             var bStablyNamed = bunch.Archive.ReadBit();
             if (bStablyNamed)
@@ -1782,7 +1835,7 @@ namespace Unreal.Core
             }
 
             // Serialize the class in case we have to spawn it.
-            NetworkGUID? classNetGUID = InternalLoadObject(bunch.Archive, false);
+            var classNetGUID = InternalLoadObject(bunch.Archive, false);
 
             if (!classNetGUID.IsValid())
             {
@@ -1806,13 +1859,15 @@ namespace Unreal.Core
         /// <summary>
         /// see https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/NetConnection.cpp#L1007
         /// </summary>
-        public virtual void ReceivedRawPacket(ReadOnlySpan<byte> packet)
+        public virtual void ReceivedRawPacket(FArchive archive, int packetSize)
         {
-            var lastByte = packet[^1];
+            var ptr = archive.BasePointer + archive.Position;
+            archive.Seek(packetSize, SeekOrigin.Current);
+            var lastByte = ptr[packetSize - 1];
 
             if (lastByte != 0)
             {
-                var bitSize = (packet.Length * 8) - 1;
+                var bitSize = (packetSize * 8) - 1;
 
                 // Bit streaming, starts at the Least Significant Bit, and ends at the MSB.
                 while (!((lastByte & 0x80) >= 1))
@@ -1821,15 +1876,11 @@ namespace Unreal.Core
                     bitSize--;
                 }
 
-                var bitArchive = new BitReader(packet, bitSize)
-                {
-                    EngineNetworkVersion = Replay.Header.EngineNetworkVersion,
-                    NetworkVersion = Replay.Header.NetworkVersion,
-                    ReplayHeaderFlags = Replay.Header.Flags
-                };
+                _packetReader.SetBits(ptr, packetSize, bitSize);
+
                 try
                 {
-                    ReceivedPacket(bitArchive);
+                    ReceivedPacket(_packetReader);
                 }
                 catch (Exception ex)
                 {
@@ -1847,7 +1898,7 @@ namespace Unreal.Core
         /// see https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DemoNetDriver.cpp#L3352
         /// see https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/NetConnection.cpp#L1525
         /// </summary>
-        public virtual void ReceivedPacket(FBitArchive bitReader)
+        public virtual void ReceivedPacket(NetBitReader bitReader)
         {
             // https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DemoNetDriver.cpp#L5101
             // InternalAck always true!
@@ -1868,7 +1919,7 @@ namespace Unreal.Core
                 // FInBunch
                 // https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Private/DataBunch.cpp#L18
                 // https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Engine/Public/Net/DataBunch.h#L168
-                var bunch = new DataBunch();
+                var bunch = _currentBunch;
 
                 var bControl = bitReader.ReadBit();
                 bunch.PacketId = InPacketId;
@@ -1920,12 +1971,12 @@ namespace Unreal.Core
                 bunch.bPartialInitial = bunch.bPartial && bitReader.ReadBit();
                 bunch.bPartialFinal = bunch.bPartial && bitReader.ReadBit();
 
-                ChannelType chType = ChannelType.None;
-                ChannelName chName = ChannelName.None;
+                var chType = ChannelType.None;
+                var chName = ChannelName.None;
 
                 if (bitReader.EngineNetworkVersion < EngineNetworkVersionHistory.HISTORY_CHANNEL_NAMES)
                 {
-                    var type = bitReader.ReadSerializedInt((int)ChannelType.MAX);
+                    bitReader.ReadSerializedInt((int)ChannelType.MAX);
                     //    chType = (bunch.bReliable || bunch.bOpen) ? (ChannelType)type : ChannelType.None;
 
                     //    chName = chType switch
@@ -1961,12 +2012,22 @@ namespace Unreal.Core
                 // Channel && (Bunch.ChName != NAME_None) && (Bunch.ChName != Channel->ChName)
 
                 var bunchDataBits = (int)bitReader.ReadSerializedInt(MaxPacketSizeInBits);
-                bunch.Archive = new BitReader(bitReader.ReadBits(bunchDataBits), bunchDataBits)
+
+                if (bunch.bPartial)
                 {
-                    EngineNetworkVersion = bitReader.EngineNetworkVersion,
-                    NetworkVersion = bitReader.NetworkVersion,
-                    ReplayHeaderFlags = bitReader.ReplayHeaderFlags
-                };
+                    // TODO
+                    bunch.Archive = bitReader.GetNetBitReader(bunchDataBits);
+                }
+                else
+                {
+                    bitReader.SetTempEnd(bunchDataBits, 0);
+                    bunch.Archive = bitReader;
+                }
+
+                bunch.Archive.EngineNetworkVersion = bitReader.EngineNetworkVersion;
+                bunch.Archive.NetworkVersion = bitReader.NetworkVersion;
+                bunch.Archive.ReplayHeaderFlags = bitReader.ReplayHeaderFlags;
+
                 bunchIndex++;
 
                 if (bunch.bHasPackageMapExports)
@@ -2057,11 +2118,18 @@ namespace Unreal.Core
                 try
                 {
                     // Dispatch the raw, unsequenced bunch to the channel
-                    ReceivedRawBunch(bunch);
+                    ReceivedNextBunch(bunch);
                 }
                 catch (Exception ex)
                 {
                     _logger?.LogError(ex, "failed ReceivedRawBunch, index: {}", bunchIndex);
+                }
+                finally
+                {
+                    if (!bunch.bPartial)
+                    {
+                        bunch.Archive.RestoreTemp(0);
+                    }
                 }
             }
 
@@ -2080,6 +2148,16 @@ namespace Unreal.Core
         /// Receive an <see cref="IExternalData"/> group.
         /// </summary>
         protected abstract void OnExternalDataRead(uint channelIndex, IExternalData? exportGroup);
+
+        /// <summary>
+        /// After receiving propteries for this <paramref name="exportGroup"/> indicate wheter it can be ignored for the rest of the replay (on the given channel)
+        /// or if it can be ignored for the rest of the replay. 
+        /// Useful to minimize the parsing, e.g. if you're only interested in the initial values and not subsequent updates. 
+        /// </summary>
+        protected virtual bool IgnoreGroupOnChannel(uint channelIndex, INetFieldExportGroup exportGroup)
+        {
+            return true;
+        }
 
 
         /// <summary>
@@ -2131,7 +2209,7 @@ namespace Unreal.Core
 
             var decompressedSize = archive.ReadInt32();
             var compressedSize = archive.ReadInt32();
-            ReadOnlySpan<byte> compressedBuffer = archive.ReadBytes(compressedSize);
+            var compressedBuffer = archive.ReadBytes(compressedSize);
 
             _logger?.LogDebug("Decompressing archive from {compressedSize} to {decompressedSize}.", compressedSize, decompressedSize);
             throw new NotImplementedException("Replay is marked as compressed. Make sure to implement this method to decompress the chunks");

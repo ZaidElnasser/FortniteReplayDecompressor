@@ -8,12 +8,21 @@ namespace Unreal.Core
     /// A <see cref="BitReader"/> used for reading everything related to RepLayout. 
     /// see https://github.com/EpicGames/UnrealEngine/blob/bf95c2cbc703123e08ab54e3ceccdd47e48d224a/Engine/Source/Runtime/CoreUObject/Public/UObject/CoreNet.h#L303
     /// </summary>
-    public class NetBitReader : BitReader
+    public unsafe sealed class NetBitReader : BitReader
     {
-        public NetBitReader(byte[] input) : base(input) { }
-        public NetBitReader(byte[] input, int bitCount) : base(input, bitCount) { }
-        public NetBitReader(ReadOnlySpan<byte> input) : base(input.ToArray()) { }
-        public NetBitReader(ReadOnlySpan<byte> input, int bitCount) : base(input.ToArray(), bitCount) { }
+        public NetBitReader() : base() { }
+        public NetBitReader(byte* buffer, int byteCount, int bitCount) : base(buffer, byteCount, bitCount) { }
+        private NetBitReader(bool* boolPtr, int bitCount) : base(boolPtr, bitCount) { }
+
+        public NetBitReader GetNetBitReader(int bitCount)
+        {
+            NetBitReader reader = new NetBitReader(Bits + Position, bitCount)
+            {
+                Items = Items.Slice(Position, bitCount)
+            };
+            Position += bitCount;
+            return reader;
+        }
 
         public int SerializePropertyInt()
         {
@@ -193,8 +202,8 @@ namespace Unreal.Core
         /// </summary>
         public int SerializePropertyEnum()
         {
-            return ReadBitsToInt(GetBitsLeft());
             // Ar.SerializeBits(Data, FMath::CeilLogTwo64(Enum->GetMaxEnumValue()));
+            return ReadBitsToInt(GetBitsLeft());
         }
 
         /// <summary>

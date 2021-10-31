@@ -1,19 +1,8 @@
 ﻿/*
 === Kraken Decompressor for Windows ===
-Converted to C# for Fortnite by SL-x-TnT, original source code available at https://github.com/powzix/ooz.
-
-Copyright (C) 2016, Powzix
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
+Converted to C# for Fortnite from: https://github.com/powzix/ooz
 */
+
 
 using OozSharp.Exceptions;
 using OozSharp.Extensions;
@@ -29,41 +18,30 @@ namespace OozSharp
         /// <summary>
         /// Decompression for the <paramref name="compressedInput"/>.
         /// </summary>
-        /// <param name="compressedInput"></param>
-        /// <param name="uncompressedSize"></param>
-        /// <returns>Decompressed byte[]</returns>
-        public ReadOnlyMemory<byte> Decompress(ReadOnlySpan<byte> compressedInput, int uncompressedSize)
+        public void Decompress(byte* compressedInput, int compressedSize, byte* uncompressed, int uncompressedSize)
         {
             using var decoder = new KrakenDecoder();
 
-            var decompressedBuffer = new byte[uncompressedSize];
             var remainingBytes = uncompressedSize;
-            var sourceLength = compressedInput.Length;
+            var sourceLength = compressedSize;
             var destinationOffset = 0;
 
-            fixed (byte* decompressedBufferPtr = decompressedBuffer)
-            fixed (byte* compressedInputPtr = compressedInput)
-            fixed (byte* scratchPtr = decoder.Scratch)
+            var sourceStart = compressedInput;
+            var decompressBufferStart = uncompressed;
+
+            while (remainingBytes != 0)
             {
-                var sourceStart = compressedInputPtr;
-                var decompressBufferStart = decompressedBufferPtr;
-
-                while (remainingBytes != 0)
+                if (!DecodeStep(decoder, uncompressed, destinationOffset, remainingBytes, sourceStart, sourceLength, decoder.Scratch))
                 {
-                    if (!DecodeStep(decoder, decompressedBufferPtr, destinationOffset, remainingBytes, sourceStart, sourceLength, scratchPtr))
-                    {
-                        throw new DecoderException($"Failed DecodeStep method");
-                    }
-
-                    sourceStart += decoder.SourceUsed;
-                    sourceLength -= decoder.SourceUsed;
-
-                    destinationOffset += decoder.DestinationUsed;
-                    remainingBytes -= decoder.DestinationUsed;
+                    throw new DecoderException($"Failed DecodeStep method");
                 }
-            }
 
-            return decompressedBuffer;
+                sourceStart += decoder.SourceUsed;
+                sourceLength -= decoder.SourceUsed;
+
+                destinationOffset += decoder.DestinationUsed;
+                remainingBytes -= decoder.DestinationUsed;
+            }
         }
 
         private bool DecodeStep(KrakenDecoder decoder, byte* destination, int destinationOffset, int remainingDestinationBytes, byte* source, int sourceBytesleft, byte* scratch)
@@ -77,7 +55,7 @@ namespace OozSharp
                 source += 2;
             }
 
-            // Only need Mermaid for Fortnite
+            //Only need Mermaid for Fortnite
             //"Oodle initializing compressor with Mermaid, level Normal, SpaceSpeed tradeoff 256"
             var isKrakenDecoder = decoder.Header.DecoderType == DecoderTypes.Mermaid;
             var destinationBytesLeft = Math.Min(isKrakenDecoder ? 0x40000 : 0x4000, remainingDestinationBytes);
@@ -143,7 +121,9 @@ namespace OozSharp
                 }
                 else
                 {
-                    throw new NotImplementedException($"memset(dst_start + offset, qhdr.checksum, dst_bytes_left);");
+                    var val = quantumHeader.Checksum;
+
+                    Buffer.MemoryCopy(&val, destination + destinationOffset, destinationBytesLeft, destinationBytesLeft);
                 }
 
                 decoder.SourceUsed = (int)(source - sourceIn);
@@ -204,7 +184,6 @@ namespace OozSharp
         {
             var sourceOrg = source;
             int sourceSize;
-            int destinationSize;
 
             if (sourceEnd - source < 2)
             {

@@ -11,8 +11,6 @@ namespace Unreal.Core.Models
     /// </summary>
     public class NetGuidCache
     {
-        //public Dictionary<uint, NetGuidCacheObject> ObjectLookup { get; private set; } = new Dictionary<uint, NetGuidCacheObject>();
-
         /// <summary>
         /// Maps net field export group name to the respective NetFieldExportGroup
         /// </summary>

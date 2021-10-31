@@ -3,11 +3,11 @@ using Xunit;
 
 namespace OozSharp.Test
 {
-    public class DecompressTest
+    public unsafe class DecompressTest
     {
         [Theory]
-        [InlineData(@"CompressedChunk/mermaid-fortnite.dump", 405273)]
-        public void MermaidTest(string data, int expectedSize)
+        [InlineData(@"CompressedChunk/mermaid-fortnite.dump", 214323, 405273)]
+        public void MermaidTest(string data, int compressedSize, int decompressedSize)
         {
             using var stream = File.Open(data, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var ms = new MemoryStream();
@@ -15,8 +15,16 @@ namespace OozSharp.Test
             var rawData = ms.ToArray();
 
             var kraken = new Kraken();
-            var result = kraken.Decompress(rawData, expectedSize);
-            Assert.Equal(expectedSize, result.Length);
+
+            fixed (byte* source = rawData)
+            fixed (byte* result = new byte[decompressedSize])
+            {
+                var local = source;
+                var localResult = result;
+
+                var ex = Record.Exception(() => kraken.Decompress(local, compressedSize, localResult, decompressedSize));
+                Assert.Null(ex);
+            }
         }
     }
 }

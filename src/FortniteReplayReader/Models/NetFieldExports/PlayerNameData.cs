@@ -1,6 +1,5 @@
 ﻿using System;
-using Unreal.Core;
-using Unreal.Core.Models;
+using System.IO;
 
 namespace FortniteReplayReader.Models.NetFieldExports
 {
@@ -12,20 +11,22 @@ namespace FortniteReplayReader.Models.NetFieldExports
         public string EncodedName { get; private set; }
         public string DecodedName { get; private set; }
 
-        public PlayerNameData(FArchive archive)
+        public PlayerNameData(ReadOnlyMemory<byte> data)
         {
+            using var archive = new Unreal.Core.BinaryReader(new MemoryStream(data.ToArray(), false));
+
             Handle = archive.ReadByte();
             Unknown1 = archive.ReadByte();
             IsPlayer = archive.ReadBoolean();
             EncodedName = archive.ReadFString();
 
-            string decodedName = String.Empty;
+            var decodedName = "";
 
             if (IsPlayer)
             {
-                for (int i = 0; i < EncodedName.Length; i++)
+                for (var i = 0; i < EncodedName.Length; i++)
                 {
-                    int shift = (EncodedName.Length % 4 * 3 % 8 + 1 + i) * 3 % 8;
+                    var shift = (EncodedName.Length % 4 * 3 % 8 + 1 + i) * 3 % 8;
                     decodedName += (char)(EncodedName[i] + shift);
                 }
 

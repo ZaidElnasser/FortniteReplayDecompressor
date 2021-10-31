@@ -4,14 +4,13 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using Unreal.Core.Models.Enums;
 
 namespace ConsoleReader
 {
-    class Program
+    internal class Program
     {
-        static void Main(string[] args)
+        private static void Main(string[] args)
         {
             var serviceCollection = new ServiceCollection()
                 .AddLogging(loggingBuilder => loggingBuilder
@@ -26,7 +25,7 @@ namespace ConsoleReader
             var replayFiles = Directory.EnumerateFiles(replayFilesFolder, "*.replay");
 
             var sw = new Stopwatch();
-            var reader = new ReplayReader(logger, ParseMode.Minimal);
+            var reader = new ReplayReader(null, ParseMode.Minimal);
             long total = 0;
             foreach (var replayFile in replayFiles)
             {

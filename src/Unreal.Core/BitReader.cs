@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -11,39 +13,45 @@ namespace Unreal.Core
     /// see https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Core/Public/Serialization/BitArchive.h
     /// see https://github.com/EpicGames/UnrealEngine/blob/70bc980c6361d9a7d23f6d23ffe322a2d6ef16fb/Engine/Source/Runtime/Core/Private/Serialization/BitArchive.cpp
     /// </summary>
-    public class BitReader : FBitArchive
+    public unsafe partial class BitReader : FBitArchive
     {
-        private ReadOnlyMemory<byte> Buffer { get; set; }
+        private bool _disposed;
+        private int[] _tempLastBit = GetPool();
+        private int[] _tempPosition = GetPool();
+        private static ConcurrentQueue<int[]> _positionQueues = new ConcurrentQueue<int[]>();
 
-        public override int Position { get; protected set; }
-
-        private int CurrentByte => Position >> 3;
+        private int _position;
+        public override int Position { get => _position; protected set => _position = value; }
 
         public int LastBit { get; private set; }
-
         public override int MarkPosition { get; protected set; }
+        public override unsafe byte* BasePointer => (byte*)_owner.PinnedMemory.Pointer;
 
-        /// <summary>
-        /// Initializes a new instance of the BitReader class based on the specified bytes.
-        /// </summary>
-        /// <param name="input">The input bytes.</param>
-        public BitReader(ReadOnlySpan<byte> input)
+        public BitReader()
         {
-            Buffer = input.ToArray();
-            LastBit = Buffer.Length * 8;
+
         }
 
-        /// <summary>
-        /// Initializes a new instance of the BitReader class based on the specified bytes.
-        /// </summary>
-        /// <param name="input">The input bool[].</param>
-        /// <param name="bitCount">Set last bit position.</param>
-        public BitReader(ReadOnlySpan<byte> input, int bitCount)
+        public BitReader(byte* ptr, int byteCount, int bitCount)
         {
-            Buffer = input.ToArray();
+            CreateBitArray(ptr, byteCount, bitCount);
+        }
+
+        public BitReader(bool* boolPtr, int bitCount)
+        {
+            Bits = boolPtr;
             LastBit = bitCount;
         }
 
+        private static int[] GetPool()
+        {
+            if (_positionQueues.TryDequeue(out var result))
+            {
+                return result;
+            }
+
+            return new int[8];
+        }
 
         public override bool AtEnd()
         {
@@ -57,20 +65,18 @@ namespace Unreal.Core
 
         public override bool PeekBit()
         {
-            return (Buffer.Span[CurrentByte] & (1 << (Position & 7))) > 0;
+            return Bits[_position];
         }
 
         public override bool ReadBit()
         {
-            if (AtEnd() || IsError)
+            if (_position >= LastBit)
             {
                 IsError = true;
                 return false;
             }
 
-            var result = (Buffer.Span[CurrentByte] & (1 << (Position & 7))) > 0;
-            Position++;
-            return result;
+            return Bits[_position++];
         }
 
         public override T[] ReadArray<T>(Func<T> func1)
@@ -80,71 +86,37 @@ namespace Unreal.Core
 
         public override int ReadBitsToInt(int bitCount)
         {
-            var result = new byte();
+            if (!CanRead(bitCount))
+            {
+                IsError = true;
+                return 0;
+            }
+
+            var result = 0;
             for (var i = 0; i < bitCount; i++)
             {
-                if (IsError)
-                {
-                    return 0;
-                }
-
-                if (ReadBit())
-                {
-                    result |= (byte)(1 << i);
-                }
+                result |= (byte)(GetAsByte(_position + i) << i);
             }
+
+            _position += bitCount;
             return result;
         }
 
-        public override ReadOnlySpan<byte> ReadBits(int bitCount)
+        public override ReadOnlyMemory<bool> ReadBits(int bitCount)
         {
             if (!CanRead(bitCount) || bitCount < 0)
             {
                 IsError = true;
-                return ReadOnlySpan<byte>.Empty;
+                return ReadOnlyMemory<bool>.Empty;
             }
 
-            var bitCountUsedInByte = Position & 7;
-            var byteCount = bitCount / 8;
-            var extraBits = bitCount % 8;
-            if (bitCountUsedInByte == 0 && extraBits == 0)
-            {
-                var byteResult = Buffer.Span.Slice(CurrentByte, byteCount);
-                Position += bitCount;
-                return byteResult;
-            }
-
-            Span<byte> result = new byte[(bitCount + 7) / 8];
-
-            var bitCountLeftInByte = 8 - (Position & 7);
-            var currentByte = CurrentByte;
-            var span = Buffer.Span;
-            var shiftDelta = (1 << bitCountUsedInByte) - 1;
-            for (var i = 0; i < byteCount; i++)
-            {
-                result[i] = (byte) (
-                    (span[currentByte + i] >> bitCountUsedInByte) |
-                    ((span[currentByte + i + 1] & shiftDelta) << bitCountLeftInByte)
-                    );
-            }
-            Position += (byteCount * 8);
-
-            bitCount %= 8;
-            for (var i = 0; i < bitCount; i++)
-            {
-                var bit = (Buffer.Span[CurrentByte] & (1 << (Position & 7))) > 0;
-                Position++;
-                if (bit)
-                {
-                    result[^1] |= (byte) (1 << i);
-                }
-            }
-
+            var result = Items.Slice(_position, bitCount);
+            _position += bitCount;
             return result;
         }
 
 
-        public override ReadOnlySpan<byte> ReadBits(uint bitCount)
+        public override ReadOnlyMemory<bool> ReadBits(uint bitCount)
         {
             return ReadBits((int)bitCount);
         }
@@ -162,15 +134,37 @@ namespace Unreal.Core
             return result;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private unsafe byte ReadByteNoCheck()
+        {
+            var result = new byte();
+
+            var pos = _position;
+
+            result |= (GetAsByte(pos + 0));
+            result |= (byte)(GetAsByte(pos + 1) << 1);
+            result |= (byte)(GetAsByte(pos + 2) << 2);
+            result |= (byte)(GetAsByte(pos + 3) << 3);
+            result |= (byte)(GetAsByte(pos + 4) << 4);
+            result |= (byte)(GetAsByte(pos + 5) << 5);
+            result |= (byte)(GetAsByte(pos + 6) << 6);
+            result |= (byte)(GetAsByte(pos + 7) << 7);
+
+            _position += 8;
+
+            return result;
+        }
+
         public override byte ReadByte()
         {
-            var bitCountUsedInByte = Position & 7;
-            var bitCountLeftInByte = 8 - (Position & 7);
+            if (!CanRead(8))
+            {
+                IsError = true;
 
-            var result = (bitCountUsedInByte == 0) ? Buffer.Span[CurrentByte] : (byte)((Buffer.Span[CurrentByte] >> bitCountUsedInByte) | ((Buffer.Span[CurrentByte + 1] & ((1 << bitCountUsedInByte) - 1)) << bitCountLeftInByte));
+                return 0;
+            }
 
-            Position += 8;
-            return result;
+            return ReadByteNoCheck();
         }
 
         public override T ReadByteAsEnum<T>()
@@ -178,32 +172,40 @@ namespace Unreal.Core
             return (T)Enum.ToObject(typeof(T), ReadByte());
         }
 
-        public override ReadOnlySpan<byte> ReadBytes(int byteCount)
+        public void ReadBytes(Span<byte> data)
         {
-            if (!CanRead(byteCount * 8) || byteCount < 0)
+            if (!CanRead(data.Length * 8))
             {
                 IsError = true;
-                return Span<byte>.Empty;
+                return;
             }
 
-            var bitCountUsedInByte = Position & 7;
-            var bitCountLeftInByte = 8 - (Position & 7);
-            ReadOnlySpan<byte> result;
-            if (bitCountUsedInByte == 0)
+            for (int i = 0; i < data.Length; i++)
             {
-                result = Buffer.Span[CurrentByte..(CurrentByte + byteCount)];
+                data[i] = ReadByteNoCheck();
             }
-            else
+        }
+
+        public override ReadOnlySpan<byte> ReadBytes(int byteCount)
+        {
+            if (byteCount < 0)
             {
-                Span<byte> output = new byte[byteCount];
-                for (var i = 0; i < byteCount; i++)
-                {
-                    output[i] = (byte)((Buffer.Span[CurrentByte + i] >> bitCountUsedInByte) | ((Buffer.Span[CurrentByte + 1 + i] & ((1 << bitCountUsedInByte) - 1)) << bitCountLeftInByte));
-                }
-                result = output;
+                IsError = true;
+                return ReadOnlySpan<byte>.Empty;
             }
 
-            Position += (byteCount * 8);
+            if (!CanRead(byteCount))
+            {
+                IsError = true;
+                return ReadOnlySpan<byte>.Empty;
+            }
+
+            Span<byte> result = new byte[byteCount];
+            for (int i = 0; i < result.Length; i++)
+            {
+                result[i] = ReadByteNoCheck();
+            }
+
             return result;
         }
 
@@ -233,7 +235,10 @@ namespace Unreal.Core
             }
 
             var encoding = isUnicode ? Encoding.Unicode : Encoding.Default;
-            return encoding.GetString(ReadBytes(length)).Trim(new[] { ' ', '\0' });
+            Span<byte> bytes = stackalloc byte[length];
+            ReadBytes(bytes);
+
+            return encoding.GetString(bytes).Trim(new[] { ' ', '\0' });
         }
 
         public override string ReadFName()
@@ -277,28 +282,35 @@ namespace Unreal.Core
 
         public override uint ReadSerializedInt(int maxValue)
         {
-            uint value = 0;
+            int value = 0;
+            int count = 0;
+
             for (uint mask = 1; (value + mask) < maxValue; mask *= 2)
             {
-                if (ReadBit())
+                if (_position >= LastBit)
                 {
-                    value |= mask;
+                    IsError = true;
+                    return 0;
                 }
+
+                value |= GetAsByte(_position++) << count++;
             }
 
-            return value;
+            return (uint)value;
         }
 
         public override short ReadInt16()
         {
-            var value = ReadBytes(2);
-            return IsError ? (short)0 : BitConverter.ToInt16(value);
+            Span<byte> value = stackalloc byte[2];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadInt16LittleEndian(value);
         }
 
         public override int ReadInt32()
         {
-            var value = ReadBytes(4);
-            return IsError ? 0 : BitConverter.ToInt32(value);
+            Span<byte> value = stackalloc byte[4];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadInt32LittleEndian(value);
         }
 
         public override bool ReadInt32AsBoolean()
@@ -308,46 +320,40 @@ namespace Unreal.Core
 
         public override long ReadInt64()
         {
-            var value = ReadBytes(8);
-            return IsError ? 0 : BitConverter.ToInt64(value);
+            Span<byte> value = stackalloc byte[8];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadInt64LittleEndian(value);
         }
 
         public override uint ReadIntPacked()
         {
-            var bitCountUsedInByte = Position & 7;
-            var bitCountLeftInByte = 8 - (Position & 7);
-            var srcMaskByte0 = (byte)((1U << bitCountLeftInByte) - 1U);
-            var srcMaskByte1 = (byte)((1U << bitCountUsedInByte) - 1U);
-            var srcIndex = CurrentByte;
-            var nextSrcIndex = bitCountUsedInByte != 0 ? srcIndex + 1 : srcIndex;
+            int value = 0;
+            byte count = 0;
+            var remaining = true;
 
-            uint value = 0;
-            for (int It = 0, shiftCount = 0; It < 5; ++It, shiftCount += 7)
+            while (remaining)
             {
-                if (!CanRead(8))
+                if (_position + 8 > LastBit)
                 {
                     IsError = true;
-                    break;
+                    return 0;
                 }
 
-                if (nextSrcIndex >= Buffer.Length)
-                {
-                    nextSrcIndex = srcIndex;
-                }
+                remaining = Bits[_position];
 
-                Position += 8;
+                value |= GetAsByte(_position + 1) << count;
+                value |= GetAsByte(_position + 2) << (count + 1);
+                value |= GetAsByte(_position + 3) << (count + 2);
+                value |= GetAsByte(_position + 4) << (count + 3);
+                value |= GetAsByte(_position + 5) << (count + 4);
+                value |= GetAsByte(_position + 6) << (count + 5);
+                value |= GetAsByte(_position + 7) << (count + 6);
 
-                var readByte = (byte)(((Buffer.Span[srcIndex] >> bitCountUsedInByte) & srcMaskByte0) | ((Buffer.Span[nextSrcIndex] & srcMaskByte1) << (bitCountLeftInByte & 7)));
-                value = (uint)((readByte >> 1) << shiftCount) | value;
-                srcIndex++;
-                nextSrcIndex++;
-
-                if ((readByte & 1) == 0)
-                {
-                    break;
-                }
+                _position += 8;
+                count += 7;
             }
-            return value;
+
+            return (uint)value;
         }
 
         public override FQuat ReadFQuat()
@@ -453,7 +459,9 @@ namespace Unreal.Core
 
         public override float ReadSingle()
         {
-            return BitConverter.ToSingle(ReadBytes(4));
+            Span<byte> value = stackalloc byte[4];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadSingleLittleEndian(value);
         }
 
         public override (T, U)[] ReadTupleArray<T, U>(Func<T> func1, Func<U> func2)
@@ -463,12 +471,16 @@ namespace Unreal.Core
 
         public override ushort ReadUInt16()
         {
-            return BitConverter.ToUInt16(ReadBytes(2));
+            Span<byte> value = stackalloc byte[2];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadUInt16LittleEndian(value);
         }
 
         public override uint ReadUInt32()
         {
-            return BitConverter.ToUInt32(ReadBytes(4));
+            Span<byte> value = stackalloc byte[4];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadUInt32LittleEndian(value);
         }
 
         public override bool ReadUInt32AsBoolean()
@@ -483,23 +495,24 @@ namespace Unreal.Core
 
         public override ulong ReadUInt64()
         {
-            return BitConverter.ToUInt64(ReadBytes(8));
+            Span<byte> value = stackalloc byte[8];
+            ReadBytes(value);
+            return BinaryPrimitives.ReadUInt64LittleEndian(value);
         }
 
         public override void Seek(int offset, SeekOrigin seekOrigin = SeekOrigin.Begin)
         {
-            if (offset < 0 || offset >> 3 > Buffer.Length || (offset >> 3 == Buffer.Length && (offset & 7) > 0) || (seekOrigin == SeekOrigin.Current && offset + Position > (Buffer.Length * 8)))
+            if (offset < 0 || offset > LastBit || (seekOrigin == SeekOrigin.Current && offset + _position > LastBit))
             {
-                IsError = true;
-                return;
+                throw new ArgumentOutOfRangeException("Specified offset doesnt fit within the BitArray buffer");
             }
 
             _ = (seekOrigin switch
             {
-                SeekOrigin.Begin => Position = offset,
-                SeekOrigin.End => Position = (Buffer.Length * 8) - offset,
-                SeekOrigin.Current => Position += offset,
-                _ => Position = offset,
+                SeekOrigin.Begin => _position = offset,
+                SeekOrigin.End => _position = LastBit - offset,
+                SeekOrigin.Current => _position += offset,
+                _ => _position = offset,
             });
         }
 
@@ -538,16 +551,56 @@ namespace Unreal.Core
             return LastBit - Position;
         }
 
-        public override void AppendDataFromChecked(ReadOnlySpan<byte> data, int bitCount)
+        public override void AppendDataFromChecked(ReadOnlyMemory<bool> data)
         {
-            LastBit += bitCount;
+            AppendBits(data);
+        }
 
-            // this works only because partial bunches are enforced to be byte aligned
-            var combined = new byte[Buffer.Span.Length + data.Length];
-            Buffer.CopyTo(combined);
-            data.ToArray().CopyTo(combined, Buffer.Span.Length);
+        public override void SetTempEnd(int totalBits, int index = 0)
+        {
+            uint setPosition = (uint)(_position + totalBits);
 
-            Buffer = combined;
+            if (setPosition > LastBit)
+            {
+                IsError = true;
+
+                return;
+            }
+
+            _tempLastBit[index] = LastBit;
+            _tempPosition[index] = (int)setPosition;
+            LastBit = _position + totalBits;
+        }
+
+        public override void RestoreTemp(int index = 0)
+        {
+            LastBit = _tempLastBit[index];
+            _position = _tempPosition[index];
+
+            /*
+            _tempLastBit = 0;
+            _tempPosition = 0;
+            */
+
+            IsError = false;
+        }
+
+
+        protected override void Dispose(bool disposing)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (disposing)
+            {
+                DisposeBits();
+
+                _positionQueues.Enqueue(_tempLastBit);
+                _positionQueues.Enqueue(_tempPosition);
+                _disposed = true;
+            }
         }
     }
 }
