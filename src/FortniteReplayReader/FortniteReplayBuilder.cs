@@ -98,6 +98,7 @@ public class FortniteReplayBuilder
             {
                 foreach (var playerPawn in playerPawns)
                 {
+                    playerPawn.PlayerPawn.PlayerState = actorId; //Overwrite actor id
                     UpdatePlayerPawn(playerPawn.ChannelId, playerPawn.PlayerPawn);
                 }
             }
